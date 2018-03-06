@@ -1,14 +1,17 @@
 const axios = require('axios')
 const querystring = require('querystring')
-const cookie = require('./cookie')
+const cookies = require('./cookies')
 const randomPhone = require('../random-phone')
+const logger = require('../logger')
+const timeout = require('../timeout')
 
 const origin = 'https://h5.ele.me'
 
 async function request ({mobile, url} = {}) {
   const query = querystring.parse(url)
-
   let index = 0
+  let number = -1
+
   const request = axios.create({
     baseURL: origin,
     withCredentials: true,
@@ -23,57 +26,82 @@ async function request ({mobile, url} = {}) {
     }]
   })
 
-  return (async function lottery (phone) {
-    const sns = cookie[index]
+  return (async function lottery () {
+    let count = 0
+    let cookie
+    do {
+      if (index > cookies.length - 1) {
+        if (count >= 3 || number !== 1) {
+          logger.error('循环搜寻结束或下一个不是最佳', count, number)
+          throw new Error('服务器繁忙，请稍后重试\n（如果重试仍然不行，请换一个红包链接再来）')
+        }
+        // 如果这个是最佳红包，等两秒，再继续从头搜寻 “没有被锁定的 cookie”
+        index = 0
+        count++
+        await timeout(2000)
+      }
+      cookie = cookies[index++]
+    } while (cookie.lock)
 
     if (!query.sn ||
       !query.lucky_number ||
       isNaN(query.lucky_number) ||
-      !sns) {
+      !cookie) {
       throw new Error('饿了么红包链接不正确\n或\n请求饿了么服务器失败')
     }
 
-    phone = phone || randomPhone(mobile)
-    // 绑定手机号
-    await request.put(`/restapi/v1/weixin/${sns.openid}/phone`, {
-      sign: sns.eleme_key,
-      phone
-    })
-    console.log('绑定手机号', phone)
+    let phone
+    if (number === 1) {
+      // 如果这个是最佳红包，换成指定的手机号领取，并锁定 cookie
+      phone = mobile
+      cookie.lock = true
+    } else {
+      phone = randomPhone(mobile)
+    }
 
-    // 领红包
-    // eslint-disable-next-line camelcase
-    const {data: {promotion_records = []}} = await request.post(`/restapi/marketing/promotion/weixin/${sns.openid}`, {
-      device_id: '',
-      group_sn: query.sn,
-      hardware_id: '',
-      method: 'phone',
-      phone,
-      platform: query.platform,
-      sign: sns.eleme_key,
-      track_id: '',
-      unionid: 'fuck', // 别问为什么传 fuck，饿了么前端就是这么传的
-      weixin_avatar: '',
-      weixin_username: ''
-    })
+    let records = []
+    try {
+      // 绑定手机号
+      await request.put(`/restapi/v1/weixin/${cookie.sns.openid}/phone`, {
+        sign: cookie.sns.eleme_key,
+        phone
+      })
+      logger.info('绑定手机号', phone)
+
+      // 领红包
+      // eslint-disable-next-line camelcase
+      const {data} = await request.post(`/restapi/marketing/promotion/weixin/${cookie.sns.openid}`, {
+        device_id: '',
+        group_sn: query.sn,
+        hardware_id: '',
+        method: 'phone',
+        phone,
+        platform: query.platform,
+        sign: cookie.sns.eleme_key,
+        track_id: '',
+        unionid: 'fuck', // 别问为什么传 fuck，饿了么前端就是这么传的
+        weixin_avatar: '',
+        weixin_username: ''
+      })
+      records = data.promotion_records || []
+    } finally {
+      cookie.lock = false
+    }
 
     // 计算剩余第几个为最佳红包
-    const number = query.lucky_number - promotion_records.length
+    number = query.lucky_number - records.length
 
     if (number <= 0) {
       // 有时候领取成功了，但是没有返回 lucky，再调一次就可以了
-      const lucky = promotion_records.find(r => r.is_lucky) || await lottery(phone)
-      console.log('手气最佳红包已被领取', JSON.stringify(lucky))
-      return lucky
-        ? `红包领取完毕\n\n手气最佳：${lucky.sns_username}\n红包金额：${lucky.amount} 元`
+      const lucky = records.find(r => r.is_lucky) || await lottery(phone)
+      logger.info('手气最佳红包已被领取', JSON.stringify(lucky))
+      return (lucky && lucky.amount)
+        ? `手气最佳红包已被领取\n\n手气最佳：${lucky.sns_username}\n红包金额：${lucky.amount} 元`
         : '红包被人抢完\n或\n服务器繁忙'
     }
 
-    console.log(`还要领 ${number} 个红包才是手气最佳`)
-    index++
-
-    // 如果这个是最佳红包，换成指定的手机号领取
-    return lottery(number === 1 ? mobile : null)
+    logger.info(`还要领 ${number} 个红包才是手气最佳`)
+    return lottery()
   })()
 }
 
@@ -82,7 +110,7 @@ function response (options) {
     try {
       resolve({message: await request(options)})
     } catch (e) {
-      console.error(e.message)
+      logger.error(e.message)
       resolve({
         message: e.message,
         status: (e.response || {}).status
